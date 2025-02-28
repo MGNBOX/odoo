@@ -2,6 +2,7 @@
 from . import common
 from odoo.tests import tagged
 from odoo.tests.common import Form
+from odoo.tools.float_utils import float_split_str
 
 
 @tagged('post_install_l10n', '-at_install', 'post_install')
@@ -39,12 +40,12 @@ class TestManual(common.TestAr):
         invoice = self._create_invoice({'partner': self.partner_cf})
         self.assertFalse(invoice.fiscal_position_id, 'Fiscal position should be set to empty')
 
-        # Cerro Castor > IVA Liberado – Ley Nº 19.640 > Compras / Ventas Zona Franca > IVA Exento
-        invoice = self._create_invoice({'partner': self.res_partner_cerrocastor})
+        # Montana Sur > IVA Liberado - Ley Nº 19.640 > Compras / Ventas Zona Franca > IVA Exento
+        invoice = self._create_invoice({'partner': self.res_partner_montana_sur})
         self.assertEqual(invoice.fiscal_position_id, self._search_fp('Purchases / Sales Free Trade Zone'))
 
-        # Expresso > Cliente / Proveedor del Exterior >  > IVA Exento
-        invoice = self._create_invoice({'partner': self.res_partner_expresso})
+        # Barcelona food > Cliente / Proveedor del Exterior >  > IVA Exento
+        invoice = self._create_invoice({'partner': self.res_partner_barcelona_food})
         self.assertEqual(invoice.fiscal_position_id, self._search_fp('Purchases / Sales abroad'))
 
     def test_03_corner_cases(self):
@@ -173,3 +174,17 @@ class TestManual(common.TestAr):
 
         # If we create an invoice it will not use manual numbering
         self.assertFalse(bill.l10n_latam_manual_document_number)
+
+    def test_17_corner_cases(self):
+        """ RI partner with VAT exempt and 21. Test price unit digits """
+        self._post(self.demo_invoices['test_invoice_4'])
+        decimal_price_digits_setting = self.env.ref('product.decimal_price').digits
+        invoice_line_ids = self.demo_invoices['test_invoice_4'].invoice_line_ids
+        for line in invoice_line_ids:
+            l10n_ar_line_prices = line._l10n_ar_prices_and_taxes()
+            _unitary_part, l10n_ar_price_unit_decimal_part = float_split_str(l10n_ar_line_prices['price_unit'], decimal_price_digits_setting)
+            len_l10n_ar_price_unit_digits = len(l10n_ar_price_unit_decimal_part)
+            _unitary_part, line_price_unit_decimal_part = float_split_str(line.price_unit, decimal_price_digits_setting)
+            len_line_price_unit_digits = len(line_price_unit_decimal_part)
+            if len_l10n_ar_price_unit_digits == len_line_price_unit_digits == decimal_price_digits_setting:
+                self.assertEqual(l10n_ar_price_unit_decimal_part, line_price_unit_decimal_part)

@@ -46,13 +46,17 @@ class AccountFiscalPosition(models.Model):
     zip_to = fields.Char(string='Zip Range To')
     # To be used in hiding the 'Federal States' field('attrs' in view side) when selected 'Country' has 0 states.
     states_count = fields.Integer(compute='_compute_states_count')
-    foreign_vat = fields.Char(string="Foreign Tax ID", help="The tax ID of your company in the region mapped by this fiscal position.")
+    foreign_vat = fields.Char(string="Foreign Tax ID", inverse="_inverse_foreign_vat", help="The tax ID of your company in the region mapped by this fiscal position.")
 
     # Technical field used to display a banner on top of foreign vat fiscal positions,
     # in order to ease the instantiation of foreign taxes when possible.
     foreign_vat_header_mode = fields.Selection(
         selection=[('templates_found', "Templates Found"), ('no_template', "No Template")],
         compute='_compute_foreign_vat_header_mode')
+
+    def _inverse_foreign_vat(self):
+        # Hook for extension
+        pass
 
     def _compute_states_count(self):
         for position in self:
@@ -244,39 +248,16 @@ class AccountFiscalPosition(models.Model):
         if not partner:
             return self.env['account.fiscal.position']
 
-        # If no "delivery" partner is specified, we assume it will be the "invoicing" partner.
-        if not delivery:
-            delivery = partner
-
         company = self.env.company
+        intra_eu = vat_exclusion = False
+        if company.vat and partner.vat:
+            eu_country_codes = set(self.env.ref('base.europe').country_ids.mapped('code'))
+            intra_eu = company.vat[:2] in eu_country_codes and partner.vat[:2] in eu_country_codes
+            vat_exclusion = company.vat[:2] == partner.vat[:2]
 
-        # The purpose of this part is to avoid making (lot of) extra queries by using ref on 'base.europe'
-        res_model, res_id = self.env['ir.model.data']._xmlid_to_res_model_res_id('base.europe')
-        eu_country_group = self.env[res_model].browse(res_id)
-        eu_country_codes = set(eu_country_group.country_ids.mapped('code'))
-
-        delivery_country = delivery.country_id
-        vat_valid = self._get_vat_valid(partner, company)
-
-        eu_vat_partner = partner.vat and partner.vat[:2] in eu_country_codes
-        eu_partner = partner.country_code in eu_country_codes
-        eu_delivery = delivery.country_code in eu_country_codes
-        domestic_delivery = delivery_country == company.country_id
-        external_delivery = delivery_country != partner.country_id
-
-        # If the delivery is to a different country than the partner's country (external delivery),
-        # the delivery is within the EU, and the partner does not have a valid EU VAT number,
-        # then assign the company's country as the delivery country) and force vat_valid to True
-        # in order to get the domestic FP
-        if external_delivery and eu_delivery and not eu_vat_partner:
-            delivery_country = company.country_id
-            vat_valid = True
-
-        # If the delivery is to the same country as the company's country (domestic delivery),
-        # the partner has a valid EU VAT number but is not from EU,
-        # we need to force vat_valid to False in order to get the EU private FP
-        if domestic_delivery and eu_vat_partner and not eu_partner:
-            vat_valid = False
+        # If company and partner have the same vat prefix (and are both within the EU), use invoicing
+        if not delivery or (intra_eu and vat_exclusion):
+            delivery = partner
 
         # partner manually set fiscal position always win
         manual_fiscal_position = (
@@ -287,11 +268,12 @@ class AccountFiscalPosition(models.Model):
             return manual_fiscal_position
 
         # First search only matching VAT positions
-        fp = self._get_fpos_by_region(delivery_country.id, delivery.state_id.id, delivery.zip, vat_valid)
+        vat_required = bool(partner.vat)
+        fp = self._get_fpos_by_region(delivery.country_id.id, delivery.state_id.id, delivery.zip, vat_required)
 
         # Then if VAT required found no match, try positions that do not require it
-        if not fp and vat_valid:
-            fp = self._get_fpos_by_region(delivery_country.id, delivery.state_id.id, delivery.zip, False)
+        if not fp and vat_required:
+            fp = self._get_fpos_by_region(delivery.country_id.id, delivery.state_id.id, delivery.zip, False)
 
         return fp or self.env['account.fiscal.position']
 
@@ -564,7 +546,8 @@ class ResPartner(models.Model):
         company_dependent=True, copy=False, readonly=False)
     use_partner_credit_limit = fields.Boolean(
         string='Partner Limit', groups='account.group_account_invoice,account.group_account_readonly',
-        compute='_compute_use_partner_credit_limit', inverse='_inverse_use_partner_credit_limit')
+        compute='_compute_use_partner_credit_limit', inverse='_inverse_use_partner_credit_limit',
+        help='Set a value greater than 0.0 to activate a credit limit check')
     show_credit_limit = fields.Boolean(
         default=lambda self: self.env.company.account_use_credit_limit,
         compute='_compute_show_credit_limit', groups='account.group_account_invoice,account.group_account_readonly')
@@ -603,6 +586,7 @@ class ResPartner(models.Model):
         help="This payment term will be used instead of the default one for purchase orders and vendor bills")
     ref_company_ids = fields.One2many('res.company', 'partner_id',
         string='Companies that refers to partner')
+    supplier_invoice_count = fields.Integer(compute='_compute_supplier_invoice_count', string='# Vendor Bills')
     has_unreconciled_entries = fields.Boolean(compute='_compute_has_unreconciled_entries',
         help="The partner has at least one unreconciled debit and credit since last time the invoices & payments matching was performed.")
     last_time_entries_checked = fields.Datetime(
@@ -625,12 +609,33 @@ class ResPartner(models.Model):
     duplicated_bank_account_partners_count = fields.Integer(
         compute='_compute_duplicated_bank_account_partners_count',
     )
+    is_coa_installed = fields.Boolean(store=False, default=lambda partner: bool(partner.env.company.chart_template))
 
     def _compute_bank_count(self):
         bank_data = self.env['res.partner.bank']._read_group([('partner_id', 'in', self.ids)], ['partner_id'], ['__count'])
         mapped_data = {partner.id: count for partner, count in bank_data}
         for partner in self:
             partner.bank_account_count = mapped_data.get(partner.id, 0)
+
+    def _compute_supplier_invoice_count(self):
+        # retrieve all children partners and prefetch 'parent_id' on them
+        all_partners = self.with_context(active_test=False).search_fetch(
+            [('id', 'child_of', self.ids)],
+            ['parent_id'],
+        )
+        supplier_invoice_groups = self.env['account.move']._read_group(
+            domain=[('partner_id', 'in', all_partners.ids),
+                    ('move_type', 'in', ('in_invoice', 'in_refund'))],
+            groupby=['partner_id'], aggregates=['__count']
+        )
+        self_ids = set(self._ids)
+
+        self.supplier_invoice_count = 0
+        for partner, count in supplier_invoice_groups:
+            while partner:
+                if partner.id in self_ids:
+                    partner.supplier_invoice_count += count
+                partner = partner.parent_id
 
     def _get_duplicated_bank_accounts(self):
         self.ensure_one()
@@ -775,6 +780,7 @@ class ResPartner(models.Model):
                     """).format(field=sql.Identifier(field))
                     self.env.cr.execute(query, {'partner_ids': tuple(self.ids), 'n': n})
                     self.invalidate_recordset([field])
+                    self.modified([field])
             except DatabaseError as e:
                 # 55P03 LockNotAvailable
                 # 40001 SerializationFailure

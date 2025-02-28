@@ -57,6 +57,7 @@ import {
     lastLeaf,
     firstLeaf,
     convertList,
+    hasAnyFontSizeClass,
 } from '../utils/utils.js';
 
 const TEXT_CLASSES_REGEX = /\btext-[^\s]*\b/;
@@ -163,6 +164,7 @@ export const editorCommands = {
         }
         const range = selection.getRangeAt(0);
         const block = closestBlock(selection.anchorNode);
+        const isInList = closestElement(selection.anchorNode, 'LI');
         const isSelectionAtStart = firstLeaf(block) === selection.anchorNode && selection.anchorOffset === 0;
         const isSelectionAtEnd = lastLeaf(block) === selection.focusNode && selection.focusOffset === nodeSize(selection.focusNode);
         if (range.startContainer.nodeType === Node.TEXT_NODE) {
@@ -206,7 +208,7 @@ export const editorCommands = {
             block.textContent !== "" && node.textContent !== "" &&
             (
                 block.nodeName === node.nodeName ||
-                ['BLOCKQUOTE', 'PRE', 'DIV'].includes(block.nodeName)
+                block.nodeName === 'DIV'
             ) && selection.anchorNode.oid !== 'root'
         );
 
@@ -352,7 +354,7 @@ export const editorCommands = {
             }
             // Ensure that all adjacent paragraph elements are converted to
             // <li> when inserting in a list.
-            if (block.nodeName === "LI" && paragraphRelatedElements.includes(nodeToInsert.nodeName)) {
+            if (isInList && paragraphRelatedElements.includes(nodeToInsert.nodeName)) {
                 setTagName(nodeToInsert, "LI");
             }
             // Contenteditable false property changes to true after the node is
@@ -363,12 +365,6 @@ export const editorCommands = {
                 insertBefore = false;
             } else {
                 currentNode.after(nodeToInsert);
-            }
-            if (
-                ['BLOCKQUOTE', 'PRE'].includes(block.nodeName) &&
-                paragraphRelatedElements.includes(nodeToInsert.nodeName)
-            ) {
-                nodeToInsert = setTagName(nodeToInsert, block.nodeName);
             }
             let convertedList;
             if (
@@ -384,15 +380,16 @@ export const editorCommands = {
                 currentNode.remove();
             }
             // If the first child of editable is contenteditable false element
-            // a chromium bug prevents selecting the container. Prepend a
-            // zero-width space so it's no longer the first child.
+            // a chromium bug prevents selecting the container.
+            // Add a paragraph above it so it's no longer the first child.
             if (
                 !isNodeToInsertContentEditable &&
                 editor.editable.firstChild === nodeToInsert &&
                 nodeToInsert.nodeName === 'DIV'
             ) {
-                const zws = document.createTextNode('\u200B');
-                nodeToInsert.before(zws);
+                const p = document.createElement("p");
+                p.append(document.createElement("br"));
+                nodeToInsert.before(p);
             }
             currentNode = convertedList || nodeToInsert;
         }
@@ -419,6 +416,17 @@ export const editorCommands = {
             lastPosition = [...paragraphRelatedElements, 'LI', 'UL', 'OL'].includes(currentNode.nodeName)
                 ? rightPos(lastLeaf(currentNode))
                 : rightPos(currentNode);
+        }
+        if (
+            lastPosition[0].nodeName === "A" &&
+            (lastPosition[1] === nodeSize(lastPosition[0]) || lastPosition[1] === 0) &&
+            isLinkEligibleForZwnbsp(editor.editable, lastPosition[0])
+        ) {
+            // In case the currentNode is different than A but the lastposition is A
+            // we need to pad the link with zws and adjust the selection accordingly
+            padLinkWithZws(editor.editable, lastPosition[0]);
+            currentNode = lastPosition[0].nextSibling;
+            lastPosition = getDeepestPosition(...rightPos(currentNode));
         }
         if (!editor.options.allowInlineAtRoot && lastPosition[0] === editor.editable) {
             // Correct the position if it happens to be in the editable root.
@@ -491,10 +499,10 @@ export const editorCommands = {
         }
         const isContextBlock = container => ['TD', 'DIV', 'LI'].includes(container.nodeName);
         if (!startContainer.isConnected || isContextBlock(startContainer)) {
-            startContainer = startContainerChild.parentNode;
+            startContainer = startContainerChild?.parentNode || startContainer;
         }
         if (!endContainer.isConnected || isContextBlock(endContainer)) {
-            endContainer = endContainerChild.parentNode;
+            endContainer = endContainerChild?.parentNode || endContainer;
         }
         const newRange = new Range();
         newRange.setStart(startContainer, startOffset);
@@ -510,7 +518,7 @@ export const editorCommands = {
     underline: editor => formatSelection(editor, 'underline'),
     strikeThrough: editor => formatSelection(editor, 'strikeThrough'),
     setFontSize: (editor, size) => formatSelection(editor, 'fontSize', {applyStyle: true, formatProps: {size}}),
-    setFontSizeClassName: (editor, className) => formatSelection(editor, 'setFontSizeClassName', {formatProps: {className}}),
+    setFontSizeClassName: (editor, className) => formatSelection(editor, 'setFontSizeClassName', {applyStyle: true, formatProps: {className}}),
     switchDirection: editor => {
         getDeepRange(editor.editable, { splitText: true, select: true, correctTripleClick: true });
         const selection = editor.document.getSelection();
@@ -555,6 +563,7 @@ export const editorCommands = {
         // created in the middle of the process, which we prevent here.
         editor.historyPauseSteps();
         editor.document.execCommand('removeFormat');
+        let hasFontSizeClass;
         for (const node of getTraversedNodes(editor.editable)) {
             if (node.nodeType === Node.ELEMENT_NODE && node.hasAttribute('color')) {
                 node.removeAttribute('color');
@@ -562,6 +571,15 @@ export const editorCommands = {
             const element = closestElement(node);
             element.style.removeProperty('color');
             element.style.removeProperty('background');
+            if (hasAnyFontSizeClass(element)) {
+                hasFontSizeClass = true;
+            }
+        }
+        if (hasFontSizeClass) {
+            // Calling `document.execCommand` will not remove font-size
+            // if font-size is applied through a css class. To remove
+            // those styles, font-size classes should be removed.
+            formatSelection(editor, 'setFontSizeClassName', { applyStyle: false });
         }
         textAlignStyles.forEach((textAlign, block) => {
             block.style.setProperty('text-align', textAlign);
